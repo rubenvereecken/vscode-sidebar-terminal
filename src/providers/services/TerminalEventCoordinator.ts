@@ -270,6 +270,29 @@ export class TerminalEventCoordinator implements vscode.Disposable {
       return;
     }
 
+    // Patch (ruben, round 3): only auto-rename if the terminal's name
+    // still matches the default pattern `Terminal N`. If it's anything
+    // else — a human-typed name, a previous session's restored name,
+    // anything — leave it alone.
+    //
+    // This fixes the post-reload flow where session restore correctly
+    // brings back "Schema review" or similar but, because our rename
+    // tracking map lives in-memory per webview and starts empty after
+    // reload, the next Claude reconnect used to see "no entry → rename"
+    // and clobber the restored name back to "Claude".
+    //
+    // The one case this is wrong: someone who manually types the literal
+    // string "Terminal 3" and then starts Claude gets renamed anyway.
+    // Acceptable.
+    if (!TerminalEventCoordinator._DEFAULT_NAME_RE.test(terminal.name)) {
+      // Still mark as "handled" so we don't re-check on every reconnect.
+      this._agentRenameState.set(terminalId, {
+        originalName: terminal.name,
+        setName: terminal.name,
+      });
+      return;
+    }
+
     const label = TerminalEventCoordinator._labelForAgent(type);
 
     this._agentRenameState.set(terminalId, {
@@ -286,6 +309,10 @@ export class TerminalEventCoordinator implements vscode.Disposable {
       `🏷️ [EVENT-COORDINATOR] Agent rename: ${terminalId} "${terminal.name}" -> "${label}" (ok=${ok})`
     );
   }
+
+  // Matches "Terminal 1", "Terminal 42", etc. — the default name the
+  // extension assigns when a new terminal is created.
+  private static readonly _DEFAULT_NAME_RE = /^Terminal \d+$/;
 
   private static _labelForAgent(type: string): string {
     switch (type) {
