@@ -166,8 +166,11 @@ export class KeyboardShortcutService {
       // Get the active terminal and focus it
       const activeTerminal = this._terminalManager.getActiveTerminalId();
       if (activeTerminal) {
-        // Send focus event to webview
-        this.sendWebviewCommand('focus', { terminalId: activeTerminal });
+        // Patch (ruben): was sending 'focus' which the webview doesn't
+        // listen for — the handler registry keys on 'focusTerminal'. Every
+        // other navigation method in this file sends 'focusTerminal' too,
+        // so this was an outlier bug that silently ate the focus message.
+        this.sendWebviewCommand('focusTerminal', { terminalId: activeTerminal });
       }
 
       log('🎯 [KEYBOARD] Terminal focused');

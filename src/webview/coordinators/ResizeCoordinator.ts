@@ -145,14 +145,22 @@ export class ResizeCoordinator {
   /**
    * Refit all terminals using double-fit pattern with PTY notification.
    * Uses VS Code pattern: reset styles -> fit() -> wait frame -> fit() -> notify PTY
+   *
+   * Patch (ruben): skip any terminal whose container is not currently
+   * measurable (clientWidth/Height === 0). That happens whenever a terminal
+   * is display:none (non-active tab) or the panel hasn't laid out yet. Fit()
+   * on such a container computes 0 cols and writes that to the pty, which
+   * bakes 1-col-wide newlines into scrollback forever. Never do that.
    */
   public refitAllTerminals(): void {
     try {
       const terminals = this.deps.getTerminals();
 
-      // Reset all container styles before any fit() calls
+      // Reset inline styles only on terminals we're actually going to fit.
+      // Touching hidden ones is harmless here but the style reset can make
+      // debugging confusing, so we gate on measurability up front.
       terminals.forEach((terminalData) => {
-        if (terminalData.container) {
+        if (terminalData.container && ResizeCoordinator._isMeasurable(terminalData.container)) {
           DOMUtils.resetXtermInlineStyles(terminalData.container, false);
         }
       });
@@ -164,9 +172,16 @@ export class ResizeCoordinator {
             return;
           }
 
-          try {
-            const container = terminalData.container;
+          const container = terminalData.container;
 
+          if (!ResizeCoordinator._isMeasurable(container)) {
+            log(
+              `⏭️ [RESIZE] Skipping ${terminalId}: container is 0-sized (hidden or not laid out)`
+            );
+            return;
+          }
+
+          try {
             // First fit: reset styles and fit
             DOMUtils.resetXtermInlineStyles(container, true);
             terminalData.fitAddon.fit();
@@ -179,11 +194,29 @@ export class ResizeCoordinator {
                 return;
               }
 
+              // Container may have gone hidden between frames (rapid tab
+              // switch). Re-check before the second fit to avoid writing 0.
+              if (!ResizeCoordinator._isMeasurable(container)) {
+                log(`⏭️ [RESIZE] ${terminalId} became 0-sized before second fit, abandoning`);
+                return;
+              }
+
               DOMUtils.resetXtermInlineStyles(container, true);
               terminalData.fitAddon.fit();
 
               const newCols = terminalData.terminal.cols;
               const newRows = terminalData.terminal.rows;
+
+              // Paranoid final guard: xterm's fit() should never return 0
+              // when the container is measurable, but if a bug elsewhere
+              // produces it, we must not propagate it to the pty.
+              if (newCols <= 0 || newRows <= 0) {
+                log(
+                  `🚫 [RESIZE] ${terminalId} fit() produced invalid dims ${newCols}x${newRows}, not notifying PTY`
+                );
+                return;
+              }
+
               if (typeof terminalData.terminal.refresh === 'function') {
                 const lastRow = Math.max(newRows - 1, 0);
                 terminalData.terminal.refresh(0, lastRow);
@@ -203,6 +236,15 @@ export class ResizeCoordinator {
     } catch (error) {
       log('❌ Error refitting all terminals:', error);
     }
+  }
+
+  /**
+   * Patch (ruben): a container is only safe to fit when it has actual
+   * layout dimensions. display:none, collapsed flex children, and the
+   * brief window before initial layout all return 0 here.
+   */
+  private static _isMeasurable(container: HTMLElement): boolean {
+    return container.clientWidth > 0 && container.clientHeight > 0;
   }
 
   /**

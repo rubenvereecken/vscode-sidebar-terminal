@@ -400,6 +400,15 @@ export class TerminalCreationService implements Disposable {
         async () => {
           try {
             if (terminalInstance.fitAddon) {
+              // Patch (ruben): never fit a 0-sized container. By the time
+              // the debounce fires the container should be visible, but
+              // "should" is the operative word — if the layout hasn't
+              // settled we'll write 0 cols to the pty and permanently
+              // squish the scrollback.
+              const c = terminalInstance.container;
+              if (!c || c.clientWidth === 0 || c.clientHeight === 0) {
+                return;
+              }
               terminalInstance.fitAddon.fit();
               this.notifyExtensionResize(terminalId, terminalInstance.terminal);
             }

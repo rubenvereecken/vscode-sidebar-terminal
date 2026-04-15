@@ -94,6 +94,28 @@ export class TerminalInteractionService {
     terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
       const mac = isMacPlatform();
 
+      // Patch (ruben): on macOS every Cmd-combo is an IDE-level shortcut
+      // (Cmd+P, Cmd+Shift+P, Cmd+W, Cmd+T, Cmd+1/2/3, Cmd+\, Cmd+K +
+      // chord, etc). The terminal has no business consuming any of them —
+      // let them all bubble to Cursor. Cmd+V is already handled above as
+      // "paste via native handler", which we still want, so the early
+      // return below covers both cases.
+      if (mac && event.metaKey) {
+        return false;
+      }
+
+      // Patch (ruben): Ctrl+W is Cursor's window-switching binding for
+      // users who've rebound away from Cmd+`. The shell also binds Ctrl+W
+      // to "delete word backward", which loses to the IDE here — a worthy
+      // tradeoff given the user asked for it. If you depend on shell
+      // Ctrl+W, use Opt+Backspace (zsh/bash both honour it).
+      if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+        const k = event.key.toLowerCase();
+        if (k === 'w') {
+          return false;
+        }
+      }
+
       if (
         (mac && event.metaKey && event.key === 'v') ||
         (event.ctrlKey && event.key === 'v' && !event.shiftKey)

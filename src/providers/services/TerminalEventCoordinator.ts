@@ -31,6 +31,13 @@ export class TerminalEventCoordinator implements vscode.Disposable {
   private readonly _disposables = new DisposableStore();
   private readonly _outputBuffers = new Map<string, string[]>();
 
+  // Patch (ruben): tracking for auto-rename-on-CLI-agent-connect.
+  // When an agent connects, we save the terminal's current name, then rename
+  // to the agent label (e.g. "Claude"). On disconnect we restore the original
+  // — but only if the current name still equals what we set, so user-typed
+  // renames made during the agent session win.
+  private readonly _agentRenameState = new Map<string, { originalName: string; setName: string }>();
+
   constructor(
     private readonly _terminalManager: TerminalManager,
     private readonly _sendMessage: (message: WebviewMessage) => Promise<void>,
@@ -213,6 +220,7 @@ export class TerminalEventCoordinator implements vscode.Disposable {
     const claudeStatusDisposable = this._terminalManager.onCliAgentStatusChange((event) => {
       try {
         log('📡 [EVENT-COORDINATOR] Received CLI Agent status change:', event);
+        this._applyAgentRename(event);
         log('🔄 [EVENT-COORDINATOR] Triggering full CLI Agent state sync');
         this._sendFullCliAgentStateSync();
       } catch (error) {
@@ -222,6 +230,80 @@ export class TerminalEventCoordinator implements vscode.Disposable {
 
     this._disposables.add(claudeStatusDisposable);
     log('✅ [EVENT-COORDINATOR] CLI Agent status listeners setup complete');
+  }
+
+  /**
+   * Patch (ruben): rename the terminal tab to the detected CLI agent
+   * when one connects. Once named it STAYS named until the user renames
+   * or closes the tab — we deliberately don't auto-restore on disconnect
+   * because the CLI detector's connected/disconnected signal has weaker
+   * hysteresis than it sounds and can flap on brief output gaps, causing
+   * the tab to bounce between "Claude" and "Terminal 2".
+   */
+  private _applyAgentRename(event: {
+    terminalId: string;
+    status: 'connected' | 'disconnected' | 'none';
+    // The upstream event types this as a wider `string | null` even though
+    // the runtime values match the AgentType union. We narrow defensively
+    // below via _labelForAgent's known cases.
+    type: string | null;
+  }): void {
+    const { terminalId, status, type } = event;
+
+    if (status !== 'connected' || !type) {
+      return;
+    }
+
+    // Patch (ruben, round 2): only ever rename a terminal ONCE. If the
+    // tracking map already has an entry, we've handled this terminal and
+    // any further reconnect events should leave it alone — including the
+    // case where the user has manually renamed it to something more
+    // descriptive in the meantime. Without this guard, every reconnect
+    // (heartbeat-driven, surprisingly frequent) reverted the user's
+    // chosen name back to "Claude".
+    if (this._agentRenameState.has(terminalId)) {
+      return;
+    }
+
+    const terminal = this._terminalManager.getTerminal(terminalId);
+    if (!terminal) {
+      return;
+    }
+
+    const label = TerminalEventCoordinator._labelForAgent(type);
+
+    this._agentRenameState.set(terminalId, {
+      originalName: terminal.name,
+      setName: label,
+    });
+
+    if (terminal.name === label) {
+      return;
+    }
+
+    const ok = this._terminalManager.renameTerminal(terminalId, label);
+    log(
+      `🏷️ [EVENT-COORDINATOR] Agent rename: ${terminalId} "${terminal.name}" -> "${label}" (ok=${ok})`
+    );
+  }
+
+  private static _labelForAgent(type: string): string {
+    switch (type) {
+      case 'claude':
+        return 'Claude';
+      case 'gemini':
+        return 'Gemini';
+      case 'codex':
+        return 'Codex';
+      case 'copilot':
+        return 'Copilot';
+      case 'opencode':
+        return 'OpenCode';
+      default:
+        // Unknown CLI agent type from upstream; capitalise it so we don't
+        // leave the tab as "undefined".
+        return type.charAt(0).toUpperCase() + type.slice(1);
+    }
   }
 
   // Debounce timer for config change events

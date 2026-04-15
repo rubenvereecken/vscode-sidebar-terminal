@@ -776,6 +776,10 @@ export interface WebviewMessage {
   filePath?: string;
   lineNumber?: number;
   columnNumber?: number;
+  // Patch (ruben): optional selection end for range-style terminal links
+  // like "file.ts:42-50" or "file.ts:42:5-50:10". Empty = point.
+  endLineNumber?: number;
+  endColumnNumber?: number;
   order?: string[];
   requestSource?: 'header' | 'panel'; // Source of deletion request
   timestamp?: number; // For error reporting
@@ -1121,6 +1125,10 @@ export interface TerminalLinkOpenOptions {
   readonly lineNumber?: number;
   /** Column number to navigate to */
   readonly columnNumber?: number;
+  /** Range end line (optional; if present, opens with a selection) */
+  readonly endLineNumber?: number;
+  /** Range end column (optional; requires endLineNumber) */
+  readonly endColumnNumber?: number;
   /** Terminal ID where link was clicked */
   readonly terminalId: string;
 }

@@ -65,7 +65,49 @@ export class TabEventCoordinator {
     }
 
     this.deps.setActiveTab(tabId);
+
+    // Patch (ruben): after the visibility flip, the newly-active terminal's
+    // container needs a re-fit so the pty gets the correct cols/rows. But
+    // display:block is set synchronously and the layout engine hasn't run
+    // yet — clientWidth/Height are still 0 for this frame and possibly the
+    // next. We retry on a short timer until the container is measurable,
+    // then call refitAllTerminals (which is defensive and will skip any
+    // still-hidden terminals). Gives up after ~320ms so we don't spin
+    // forever if the panel is collapsed.
+    this._scheduleRefitWhenVisible(tabId);
   };
+
+  /**
+   * Fire refitAllTerminals a few times on a short schedule. The first call
+   * may happen before layout has settled (container still 0×0), in which
+   * case ResizeCoordinator's measurability guard will no-op and we wait
+   * for the next tick. A handful of retries is cheap and robust against
+   * variable layout timing without needing to introspect the container.
+   */
+  private _scheduleRefitWhenVisible(tabId: string): void {
+    const attemptDelaysMs = [16, 48, 100, 200];
+
+    for (const delay of attemptDelaysMs) {
+      const timer = setTimeout(() => {
+        this.pendingTimeouts.delete(timer);
+
+        const coordinator = this.deps.getCoordinator();
+        if (!coordinator) {
+          return;
+        }
+
+        // Bail if the user has already switched to a different tab — the
+        // follow-up click scheduled its own refit cascade.
+        const currentActive = coordinator.getActiveTerminalId?.();
+        if (currentActive && currentActive !== tabId) {
+          return;
+        }
+
+        coordinator.refitAllTerminals?.();
+      }, delay);
+      this.pendingTimeouts.add(timer);
+    }
+  }
 
   public onTabClose = (tabId: string): void => {
     log(`🗂️ Tab close requested: ${tabId}`);

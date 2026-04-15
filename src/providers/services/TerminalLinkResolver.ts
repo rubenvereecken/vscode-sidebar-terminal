@@ -63,6 +63,33 @@ export class TerminalLinkResolver {
       return;
     }
 
+    // Patch (ruben): file:// URLs should open in the editor, not be kicked
+    // out to Finder via openExternal. Parse the URL into its path +
+    // optional line/col/range components and delegate to the same
+    // file-opening logic used for bare paths.
+    if (/^file:\/\//i.test(targetUrl)) {
+      const parsed = this._parseFileUrl(targetUrl);
+      if (parsed) {
+        log(
+          `🔗 [LINK-RESOLVER] file:// URL routed as file link: ${parsed.filePath}` +
+            (parsed.lineNumber ? `:${parsed.lineNumber}` : '')
+        );
+        await this._handleFileLink({
+          ...message,
+          linkType: 'file',
+          filePath: parsed.filePath,
+          lineNumber: parsed.lineNumber,
+          columnNumber: parsed.columnNumber,
+          endLineNumber: parsed.endLineNumber,
+          endColumnNumber: parsed.endColumnNumber,
+        } as WebviewMessage);
+        return;
+      }
+      log(
+        `⚠️ [LINK-RESOLVER] Could not parse file:// URL, falling back to openExternal: ${targetUrl}`
+      );
+    }
+
     try {
       log(`🔗 [LINK-RESOLVER] Opening URL from terminal: ${targetUrl}`);
       await vscode.env.openExternal(vscode.Uri.parse(targetUrl));
@@ -71,6 +98,88 @@ export class TerminalLinkResolver {
       const errorMessage = error instanceof Error ? error.message : String(error);
       showError(`Failed to open link in browser. ${errorMessage}`);
     }
+  }
+
+  /**
+   * Parse a file:// URL into the pieces we need for _handleFileLink.
+   *
+   * Accepted forms (all via a #fragment or : suffix):
+   *   file:///abs/path
+   *   file:///abs/path:42
+   *   file:///abs/path:42:5
+   *   file:///abs/path:42-50
+   *   file:///abs/path:42:5-50:10
+   *   file:///abs/path#L42
+   *   file:///abs/path#L42-L50
+   *   file:///abs/path#L42C5-L50C10
+   */
+  private _parseFileUrl(url: string): {
+    filePath: string;
+    lineNumber?: number;
+    columnNumber?: number;
+    endLineNumber?: number;
+    endColumnNumber?: number;
+  } | null {
+    let filePath: string;
+    let locator = '';
+
+    // Split off a #fragment if present — that's how GitHub-style line
+    // references travel through URLs.
+    const hashAt = url.indexOf('#');
+    let base = url;
+    if (hashAt >= 0) {
+      base = url.slice(0, hashAt);
+      locator = url.slice(hashAt + 1);
+    }
+
+    try {
+      const parsed = vscode.Uri.parse(base, true);
+      filePath = parsed.fsPath;
+    } catch {
+      return null;
+    }
+    if (!filePath) return null;
+
+    // If no #fragment, allow an embedded :line:col-line:col suffix on
+    // the path itself.
+    if (!locator) {
+      const suffixMatch = filePath.match(/^(.*?)(:\d+(?::\d+)?(?:-\d+(?::\d+)?)?)$/);
+      if (suffixMatch && suffixMatch[1] && suffixMatch[2]) {
+        filePath = suffixMatch[1];
+        locator = suffixMatch[2].slice(1); // drop leading colon
+      }
+    }
+
+    if (!locator) {
+      return { filePath };
+    }
+
+    // Two formats: colon-delimited (42, 42:5, 42-50, 42:5-50:10) or
+    // GitHub-style L/C-prefixed (L42, L42-L50, L42C5-L50C10).
+    const githubStyle = locator.match(/^L(\d+)(?:C(\d+))?(?:-L(\d+)(?:C(\d+))?)?$/i);
+    if (githubStyle) {
+      return {
+        filePath,
+        lineNumber: parseInt(githubStyle[1]!, 10),
+        columnNumber: githubStyle[2] ? parseInt(githubStyle[2], 10) : undefined,
+        endLineNumber: githubStyle[3] ? parseInt(githubStyle[3], 10) : undefined,
+        endColumnNumber: githubStyle[4] ? parseInt(githubStyle[4], 10) : undefined,
+      };
+    }
+
+    const colonStyle = locator.match(/^(\d+)(?::(\d+))?(?:-(\d+)(?::(\d+))?)?$/);
+    if (colonStyle) {
+      return {
+        filePath,
+        lineNumber: parseInt(colonStyle[1]!, 10),
+        columnNumber: colonStyle[2] ? parseInt(colonStyle[2], 10) : undefined,
+        endLineNumber: colonStyle[3] ? parseInt(colonStyle[3], 10) : undefined,
+        endColumnNumber: colonStyle[4] ? parseInt(colonStyle[4], 10) : undefined,
+      };
+    }
+
+    // Unknown locator format — ignore it and open the file at the top.
+    return { filePath };
   }
 
   /**
@@ -93,17 +202,34 @@ export class TerminalLinkResolver {
       const document = await vscode.workspace.openTextDocument(resolvedUri);
       const editor = await vscode.window.showTextDocument(document, { preview: true });
 
-      // Navigate to specific line/column if provided
+      // Navigate to specific line/column if provided. Patch (ruben):
+      // endLineNumber/endColumnNumber support — if present, open with a
+      // real multi-line selection instead of a collapsed caret. Useful
+      // for code review links like "file.ts:42-50".
       if (typeof message.lineNumber === 'number' && !Number.isNaN(message.lineNumber)) {
-        const line = Math.max(0, message.lineNumber - 1);
-        const columnValue =
+        const startLine = Math.max(0, message.lineNumber - 1);
+        const startCol =
           typeof message.columnNumber === 'number' && !Number.isNaN(message.columnNumber)
             ? Math.max(0, message.columnNumber - 1)
             : 0;
-        const position = new vscode.Position(line, columnValue);
-        editor.selection = new vscode.Selection(position, position);
+        const startPos = new vscode.Position(startLine, startCol);
+
+        const hasEndLine =
+          typeof message.endLineNumber === 'number' && !Number.isNaN(message.endLineNumber);
+        let endPos = startPos;
+        if (hasEndLine) {
+          const endLine = Math.max(0, (message.endLineNumber as number) - 1);
+          const endLineText = document.lineAt(Math.min(endLine, document.lineCount - 1));
+          const endCol =
+            typeof message.endColumnNumber === 'number' && !Number.isNaN(message.endColumnNumber)
+              ? Math.max(0, (message.endColumnNumber as number) - 1)
+              : endLineText.range.end.character;
+          endPos = new vscode.Position(endLine, endCol);
+        }
+
+        editor.selection = new vscode.Selection(startPos, endPos);
         editor.revealRange(
-          new vscode.Range(position, position),
+          new vscode.Range(startPos, endPos),
           vscode.TextEditorRevealType.InCenter
         );
       }

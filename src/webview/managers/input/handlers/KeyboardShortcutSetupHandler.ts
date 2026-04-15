@@ -24,6 +24,31 @@ const KeyboardConstants = {
 } as const;
 
 /**
+ * Patch (ruben): commands that the extension resolves from keybindings
+ * (meta+shift+p → showCommands, meta+p → quickOpen, etc) but then drops
+ * as no-op stubs in VSCodeCommandDispatcher.handleVSCodeCommand. Before
+ * this patch, the keybinding handler would preventDefault+stopPropagation
+ * and then invoke the stub — a black hole that swallowed every IDE
+ * shortcut Cursor has a real implementation for. Keeping them in this set
+ * lets setupKeyboardShortcuts bail out without preventDefault so the event
+ * bubbles to Cursor's own host and actually does something.
+ */
+const WEBVIEW_UNIMPLEMENTED_COMMANDS: ReadonlySet<string> = new Set([
+  'workbench.action.quickOpen',
+  'workbench.action.showCommands',
+  'workbench.action.togglePanel',
+  'workbench.action.closePanel',
+  'workbench.action.toggleSidebarVisibility',
+  'workbench.action.toggleDevTools',
+  'workbench.action.reloadWindow',
+  'workbench.action.reloadWindowWithExtensionsDisabled',
+  'workbench.action.zoomIn',
+  'workbench.action.zoomOut',
+  'workbench.action.zoomReset',
+  'workbench.action.terminal.openNativeConsole',
+]);
+
+/**
  * Dependencies required by KeyboardShortcutSetupHandler from InputManager
  */
 export interface IKeyboardShortcutSetupHandlerDeps {
@@ -94,6 +119,18 @@ export class KeyboardShortcutSetupHandler {
       this.deps.logger(
         `Keybinding: ${event.key}, Command: ${resolvedCommand}, Skip Shell: ${shouldSkip}, IME: ${this.deps.isIMEComposing()}`
       );
+
+      // Patch (ruben): if the resolved command is one the extension can't
+      // actually run in the webview context, DO NOT preventDefault. Let
+      // the event bubble to Cursor's host so the IDE can handle it with
+      // its real implementation. Without this guard, the extension
+      // captures the keystroke, logs a stub message, and drops the event.
+      if (resolvedCommand && WEBVIEW_UNIMPLEMENTED_COMMANDS.has(resolvedCommand)) {
+        this.deps.logger(
+          `⤴️ [KBD] Letting ${resolvedCommand} bubble to host (webview has no impl)`
+        );
+        return;
+      }
 
       // If should skip shell, handle as VS Code command
       if (shouldSkip && resolvedCommand) {

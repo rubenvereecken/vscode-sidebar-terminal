@@ -205,6 +205,13 @@ export class TerminalLifecycleCoordinator {
       async () => {
         try {
           if (terminalInstance.fitAddon) {
+            // Patch (ruben): never fit a hidden / 0-sized container —
+            // fitAddon.fit() will compute 0 cols/rows and we'll happily
+            // ship that to the pty, which permanently squishes the
+            // terminal's scrollback. See _isContainerMeasurable below.
+            if (!TerminalLifecycleCoordinator._isContainerMeasurable(terminalInstance.container)) {
+              return;
+            }
             terminalInstance.fitAddon.fit();
             // Notify extension about new size
             this.notifyExtensionResize(terminalId, terminalInstance.terminal);
@@ -215,6 +222,20 @@ export class TerminalLifecycleCoordinator {
       },
       { delay: LifecycleTimings.RESIZE_DEBOUNCE_DELAY_MS }
     );
+  }
+
+  /**
+   * Patch (ruben): is this container safe to fit? A container that's
+   * display:none, in a collapsed flex slot, or hasn't been laid out yet
+   * has clientWidth/Height === 0. fit() on such a container computes 0
+   * cols/rows and writes that to the pty, which permanently breaks the
+   * terminal's wrap state. The defensive guard is the same as the one in
+   * ResizeCoordinator.refitAllTerminals — but THIS layer also writes to
+   * ptys via notifyExtensionResize, so it needs its own copy.
+   */
+  private static _isContainerMeasurable(container: HTMLElement | null | undefined): boolean {
+    if (!container) return false;
+    return container.clientWidth > 0 && container.clientHeight > 0;
   }
 
   /**
@@ -433,6 +454,16 @@ export class TerminalLifecycleCoordinator {
               `resize-all-${terminalId}`,
               async () => {
                 try {
+                  // Patch (ruben): same defensive guard as handleTerminalResize.
+                  // Without this, creating a new terminal triggers a 150ms-delayed
+                  // resizeAllTerminals that fits the now-hidden previous terminal
+                  // to 0 cols and writes that to its pty — squishing the
+                  // terminal's scrollback for the rest of its life.
+                  if (
+                    !TerminalLifecycleCoordinator._isContainerMeasurable(terminalInstance.container)
+                  ) {
+                    return;
+                  }
                   terminalInstance.fitAddon.fit();
                   this.notifyExtensionResize(terminalId, terminalInstance.terminal);
                 } catch (error) {
