@@ -8,7 +8,13 @@
  * - Supports file paths with line:column navigation
  */
 
-import { Terminal, type ILink, type IDisposable } from '@xterm/xterm';
+import {
+  Terminal,
+  type ILink,
+  type IDisposable,
+  type IDecoration,
+  type IMarker,
+} from '@xterm/xterm';
 import { IManagerCoordinator } from '../interfaces/ManagerInterfaces';
 import { terminalLogger } from '../utils/ManagerLogger';
 import { BaseManager } from './BaseManager';
@@ -47,6 +53,16 @@ interface ParsedFileLink {
 export class TerminalLinkManager extends BaseManager {
   private readonly coordinator: IManagerCoordinator;
   private readonly linkProviderDisposables = new Map<string, IDisposable>();
+
+  // Patch (ruben): persistent foreground decorations for detected file
+  // links — gives them a coloured tint instead of just the hover-only
+  // underline. Cached by terminalId+path+row+startCol so the link provider
+  // (which fires on every hover) doesn't re-register for the same span.
+  private readonly linkDecorations = new Map<string, IDecoration>();
+  // Hex `#RRGGBB` only — xterm's decoration API explicitly rejects other
+  // CSS color forms. Picked to be visible against both the white default
+  // theme and dark themes; a saturated mid-blue stays readable on either.
+  private static readonly LINK_COLOR_HEX = '#3F8FE0';
 
   // Current link modifier setting (updated when settings change)
   // 'alt' means Alt is for multi-cursor, so Cmd/Ctrl opens links
@@ -197,7 +213,7 @@ export class TerminalLinkManager extends BaseManager {
     try {
       const stitched = this.stitchWrappedLogicalLine(terminal, lineNumber);
       if (!stitched) return [];
-      return this.extractFileLinksFromStitched(stitched, terminalId);
+      return this.extractFileLinksFromStitched(stitched, terminalId, terminal);
     } catch (error) {
       terminalLogger.warn('Error finding links:', error);
       return [];
@@ -383,7 +399,8 @@ export class TerminalLinkManager extends BaseManager {
 
   private extractFileLinksFromStitched(
     stitched: { text: string; positions: Array<{ x: number; y: number }> },
-    terminalId: string
+    terminalId: string,
+    terminal: Terminal
   ): ILink[] {
     const links: ILink[] = [];
     const seen = new Set<string>();
@@ -392,6 +409,7 @@ export class TerminalLinkManager extends BaseManager {
     this._collectMatches(
       stitched,
       terminalId,
+      terminal,
       this.absoluteOrExplicitRelativeRegex,
       /* captureGroup */ 0,
       seen,
@@ -405,6 +423,7 @@ export class TerminalLinkManager extends BaseManager {
     this._collectMatches(
       stitched,
       terminalId,
+      terminal,
       this.implicitRelativeRegex,
       /* captureGroup */ 1,
       seen,
@@ -417,6 +436,7 @@ export class TerminalLinkManager extends BaseManager {
   private _collectMatches(
     stitched: { text: string; positions: Array<{ x: number; y: number }> },
     terminalId: string,
+    terminal: Terminal,
     regex: RegExp,
     captureGroup: number,
     seen: Set<string>,
@@ -477,6 +497,95 @@ export class TerminalLinkManager extends BaseManager {
       };
 
       out.push(link);
+
+      // Patch (ruben): persistent foreground tint for the cells the link
+      // covers, on top of the hover-only underline. Decorations are
+      // tied to a buffer marker so they track scrolling and dispose with
+      // the line. Cached so this doesn't fire on every hover.
+      this._ensureLinkDecoration(
+        terminal,
+        terminalId,
+        cleaned,
+        stitched.positions,
+        startOffset,
+        endOffsetInclusive
+      );
+    }
+  }
+
+  /**
+   * Patch (ruben): register a coloured decoration over the cells the link
+   * occupies. The decoration's foregroundColor only accepts `#RRGGBB`, so
+   * we use a fixed hex picked to be readable on both light and dark
+   * themes. For multi-row stitched links, we register one decoration per
+   * row because xterm decorations are anchored to a single marker.
+   */
+  private _ensureLinkDecoration(
+    terminal: Terminal,
+    terminalId: string,
+    pathText: string,
+    positions: Array<{ x: number; y: number }>,
+    startOffset: number,
+    endOffsetInclusive: number
+  ): void {
+    // Group consecutive offsets by their buffer y so we can hand each row
+    // to its own marker/decoration.
+    type RowSlice = { y: number; xStart: number; xEnd: number };
+    const slices: RowSlice[] = [];
+    for (let i = startOffset; i <= endOffsetInclusive; i++) {
+      const pos = positions[i];
+      if (!pos) continue;
+      const last = slices[slices.length - 1];
+      if (last && last.y === pos.y && pos.x === last.xEnd + 1) {
+        last.xEnd = pos.x;
+      } else {
+        slices.push({ y: pos.y, xStart: pos.x, xEnd: pos.x });
+      }
+    }
+
+    const buf = terminal.buffer.active;
+    const cursorAbsRow = buf.baseY + buf.cursorY;
+
+    for (const slice of slices) {
+      const cacheKey = `${terminalId}:${slice.y}:${slice.xStart}:${pathText}`;
+      if (this.linkDecorations.has(cacheKey)) continue;
+
+      const markerOffset = slice.y - 1 - cursorAbsRow;
+
+      let marker: IMarker | undefined;
+      try {
+        marker = terminal.registerMarker(markerOffset);
+      } catch {
+        continue;
+      }
+      if (!marker) continue;
+
+      const width = slice.xEnd - slice.xStart + 1;
+      let decoration: IDecoration | undefined;
+      try {
+        decoration = terminal.registerDecoration({
+          marker,
+          // x is 0-indexed cells from the left edge; xterm link ranges
+          // and our slice xStart are 1-indexed.
+          x: slice.xStart - 1,
+          width,
+          height: 1,
+          foregroundColor: TerminalLinkManager.LINK_COLOR_HEX,
+          layer: 'top',
+        });
+      } catch {
+        marker.dispose();
+        continue;
+      }
+      if (!decoration) {
+        marker.dispose();
+        continue;
+      }
+
+      this.linkDecorations.set(cacheKey, decoration);
+      decoration.onDispose(() => {
+        this.linkDecorations.delete(cacheKey);
+      });
     }
   }
 
@@ -603,6 +712,14 @@ export class TerminalLinkManager extends BaseManager {
       disposable.dispose();
       this.linkProviderDisposables.delete(terminalId);
     }
+    // Patch (ruben): drop colour decorations for this terminal too.
+    const prefix = `${terminalId}:`;
+    for (const [key, decoration] of this.linkDecorations) {
+      if (key.startsWith(prefix)) {
+        decoration.dispose();
+        this.linkDecorations.delete(key);
+      }
+    }
   }
 
   /**
@@ -615,6 +732,9 @@ export class TerminalLinkManager extends BaseManager {
   protected doDispose(): void {
     this.linkProviderDisposables.forEach((d) => d.dispose());
     this.linkProviderDisposables.clear();
+    // Patch (ruben): dispose all colour decorations.
+    this.linkDecorations.forEach((d) => d.dispose());
+    this.linkDecorations.clear();
     terminalLogger.info('TerminalLinkManager disposed');
   }
 }
