@@ -269,8 +269,82 @@ export class TerminalLinkResolver {
       }
     }
 
+    // Patch (ruben): suffix-match fallback. Direct candidates all missed —
+    // try to find a file whose path ends with the requested (segment-wise)
+    // suffix. Handles three recurring miss cases:
+    //   1. CC prints paths relative to where you launched `claude`, which
+    //      may not match the terminal CWD VS Code is tracking.
+    //   2. CC sometimes prefixes paths with the project directory name
+    //      (e.g. "life-sandbox/finance/foo.ts") when the workspace root
+    //      IS life-sandbox, so the combined path doesn't exist.
+    //   3. The user `cd`'d elsewhere after launching the session.
+    // workspace.findFiles uses VS Code's ripgrep index and honours
+    // .gitignore, so it's fast even on huge repos.
+    const suffixMatch = await this.resolveViaSuffixMatch(filePath);
+    if (suffixMatch) return suffixMatch;
+
     log(`❌ [LINK-RESOLVER] Failed to resolve file path: ${filePath}`);
     return null;
+  }
+
+  /**
+   * Patch (ruben): find files whose path ends with the requested suffix
+   * at segment boundaries. Returns the shortest unambiguous match, or
+   * shows a quickpick if multiple tie.
+   */
+  private async resolveViaSuffixMatch(filePath: string): Promise<vscode.Uri | null> {
+    const normalized = this.normalizeLinkPath(filePath);
+    if (path.isAbsolute(normalized)) return null; // already tried as absolute
+
+    const segments = normalized.split(/[/\\]/).filter(Boolean);
+    if (segments.length === 0) return null;
+    const basename = segments[segments.length - 1]!;
+
+    // Glob for any file with this basename, bounded so a pathologically
+    // common name (like "index.ts") doesn't explode. The suffix filter
+    // narrows the result set after.
+    let found: vscode.Uri[];
+    try {
+      found = await vscode.workspace.findFiles(`**/${basename}`, undefined, 200);
+    } catch (error) {
+      log('⚠️ [LINK-RESOLVER] Suffix-match findFiles failed:', error);
+      return null;
+    }
+    if (found.length === 0) return null;
+
+    // Require the whole requested suffix to match at segment boundaries.
+    // `finance/foo.ts` must match `/.../life-sandbox/finance/foo.ts`, but
+    // `ance/foo.ts` must NOT match. We compare using normalised forward
+    // slashes on both sides.
+    const needle = segments.join('/');
+    const hits = found.filter((uri) => {
+      const hay = uri.fsPath.replace(/\\/g, '/');
+      if (!hay.endsWith(needle)) return false;
+      // Boundary check: char before the suffix must be '/' (or suffix is
+      // at the root).
+      const boundaryIdx = hay.length - needle.length - 1;
+      return boundaryIdx < 0 || hay[boundaryIdx] === '/';
+    });
+    if (hits.length === 0) return null;
+
+    if (hits.length === 1) {
+      log(`🔗 [LINK-RESOLVER] Suffix-matched "${filePath}" → ${hits[0]!.fsPath}`);
+      return hits[0]!;
+    }
+
+    // Multiple candidates — ask the user.
+    const picked = await vscode.window.showQuickPick(
+      hits.map((uri) => ({
+        label: vscode.workspace.asRelativePath(uri),
+        description: uri.fsPath,
+        uri,
+      })),
+      {
+        placeHolder: `Multiple files match "${filePath}" — pick one`,
+        matchOnDescription: true,
+      }
+    );
+    return picked?.uri ?? null;
   }
 
   /**

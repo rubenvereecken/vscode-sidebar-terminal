@@ -1,3 +1,8 @@
+<!-- Patch (ruben): personal fork — see PATCHES.md for the list of
+     divergences from upstream and why each one exists. -->
+
+> **🛠️ Ruben's fork** — this build has local patches on top of upstream. See [**PATCHES.md**](./PATCHES.md) for what's different and why.
+
 # Secondary Terminal - VS Code Extension
 
 [![Version](https://img.shields.io/visual-studio-marketplace/v/s-hiraoku.vscode-sidebar-terminal)](https://marketplace.visualstudio.com/items?itemName=s-hiraoku.vscode-sidebar-terminal)

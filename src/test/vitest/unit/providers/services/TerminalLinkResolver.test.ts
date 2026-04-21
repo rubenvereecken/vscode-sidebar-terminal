@@ -34,12 +34,15 @@ vi.mock('vscode', () => ({
   workspace: {
     openTextDocument: vi.fn().mockResolvedValue({}),
     workspaceFolders: [{ uri: { fsPath: '/workspace' } }],
+    findFiles: vi.fn().mockResolvedValue([]),
+    asRelativePath: vi.fn((uri: { fsPath: string }) => uri.fsPath),
   },
   window: {
     showTextDocument: vi.fn().mockResolvedValue({
       selection: {},
       revealRange: vi.fn(),
     }),
+    showQuickPick: vi.fn().mockResolvedValue(undefined),
   },
   Position: class {
     constructor(
@@ -134,6 +137,81 @@ describe('TerminalLinkResolver', () => {
 
       const { showError } = await import('../../../../../utils/feedback');
       expect(showError).toHaveBeenCalledWith(expect.stringContaining('Unable to locate file'));
+    });
+  });
+
+  // Patch (ruben): suffix-match fallback. When direct candidates all miss,
+  // the resolver should try to find a workspace file whose path ends with
+  // the requested suffix at segment boundaries.
+  describe('resolveFileLink suffix-match fallback', () => {
+    beforeEach(() => {
+      // Default: no direct file exists anywhere — forces the suffix path.
+      mockFs.stat.mockRejectedValue({ code: 'ENOENT' });
+    });
+
+    it('opens a single suffix match without prompting', async () => {
+      const hit = { fsPath: '/workspace/life-sandbox/finance/foo.ts' };
+      (vscode.workspace.findFiles as any).mockResolvedValue([hit]);
+
+      const uri = await resolver.resolveFileLink('finance/foo.ts');
+
+      expect(uri).toBe(hit);
+      expect(vscode.workspace.findFiles).toHaveBeenCalledWith('**/foo.ts', undefined, 200);
+      expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    });
+
+    it('rejects mid-segment suffix collisions', async () => {
+      // `ance/foo.ts` is a substring of `finance/foo.ts` but not at a
+      // segment boundary — must NOT match.
+      (vscode.workspace.findFiles as any).mockResolvedValue([
+        { fsPath: '/workspace/finance/foo.ts' },
+      ]);
+
+      const uri = await resolver.resolveFileLink('ance/foo.ts');
+
+      expect(uri).toBeNull();
+    });
+
+    it('filters candidates that share a basename but wrong path', async () => {
+      // findFiles returns every `foo.ts` in the workspace; only the one
+      // matching the requested suffix should win.
+      (vscode.workspace.findFiles as any).mockResolvedValue([
+        { fsPath: '/workspace/other/foo.ts' },
+        { fsPath: '/workspace/life-sandbox/finance/foo.ts' },
+        { fsPath: '/workspace/unrelated/nested/foo.ts' },
+      ]);
+
+      const uri = await resolver.resolveFileLink('finance/foo.ts');
+
+      expect(uri).toEqual({ fsPath: '/workspace/life-sandbox/finance/foo.ts' });
+    });
+
+    it('prompts on multiple matches and returns the user pick', async () => {
+      const a = { fsPath: '/workspace/a/foo.ts' };
+      const b = { fsPath: '/workspace/b/foo.ts' };
+      (vscode.workspace.findFiles as any).mockResolvedValue([a, b]);
+      (vscode.window.showQuickPick as any).mockResolvedValue({ uri: b });
+
+      const uri = await resolver.resolveFileLink('foo.ts');
+
+      expect(vscode.window.showQuickPick).toHaveBeenCalled();
+      expect(uri).toBe(b);
+    });
+
+    it('skips the suffix fallback for absolute paths', async () => {
+      const absPath = path.resolve('/abs/missing.ts');
+      const uri = await resolver.resolveFileLink(absPath);
+
+      expect(uri).toBeNull();
+      expect(vscode.workspace.findFiles).not.toHaveBeenCalled();
+    });
+
+    it('returns null when no suffix matches', async () => {
+      (vscode.workspace.findFiles as any).mockResolvedValue([]);
+
+      const uri = await resolver.resolveFileLink('missing/thing.ts');
+
+      expect(uri).toBeNull();
     });
   });
 

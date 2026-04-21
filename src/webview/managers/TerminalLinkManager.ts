@@ -53,6 +53,14 @@ interface ParsedFileLink {
 export class TerminalLinkManager extends BaseManager {
   private readonly coordinator: IManagerCoordinator;
   private readonly linkProviderDisposables = new Map<string, IDisposable>();
+  // Patch (ruben): registered terminals + their proactive-scan state.
+  // Proactive scan tints links as soon as xterm writes a new row, rather
+  // than waiting for the user to hover (xterm's link provider only fires
+  // on hover — great for click activation, useless for colour-on-sight).
+  private readonly proactiveScan = new Map<
+    string,
+    { terminal: Terminal; lastScannedAbsRow: number; disposables: IDisposable[] }
+  >();
 
   // Patch (ruben): persistent foreground decorations for detected file
   // links — gives them a coloured tint instead of just the hover-only
@@ -72,12 +80,13 @@ export class TerminalLinkManager extends BaseManager {
   // Patch (ruben): two regexes, run in sequence, results merged.
   //
   // absoluteOrExplicitRelativeRegex matches paths that are unambiguously
-  // paths because of their leading prefix: /abs, ./rel, ../rel, C:\win.
-  // The negative lookbehind is the critical bit: without it the regex
-  // happily matches "/server/app.ts" in the MIDDLE of "app/server/app.ts",
-  // stealing the match from the implicit-relative regex and producing a
-  // broken short absolute link. The lookbehind forbids a path-like char
-  // immediately before the prefix — the emitter-side boundary.
+  // paths because of their leading prefix: /abs, ./rel, ../rel, ~/home,
+  // C:\win. The negative lookbehind is the critical bit: without it the
+  // regex happily matches "/server/app.ts" in the MIDDLE of
+  // "app/server/app.ts", stealing the match from the implicit-relative
+  // regex and producing a broken short absolute link. The lookbehind
+  // forbids a path-like char immediately before the prefix — the
+  // emitter-side boundary.
   //
   // implicitRelativeRegex matches workspace-relative paths without a
   // leading slash (e.g. "app/server/app.ts:42", ".claude/rules/foo.md").
@@ -85,7 +94,7 @@ export class TerminalLinkManager extends BaseManager {
   // AND a dotted extension of 1-6 word chars. Leading `.` is allowed so
   // dotfiles like .claude, .vscode, .github match too.
   private readonly absoluteOrExplicitRelativeRegex =
-    /(?<![\w.\-/\\])(?:\.{0,2}\/|[A-Za-z]:\\)[^\s"'<>()[\]{}|]+/g;
+    /(?<![\w.\-/\\~])(?:~\/|\.{0,2}\/|[A-Za-z]:\\)[^\s"'<>()[\]{}|]+/g;
   // Patch (ruben): the trailing `(?:colon-style|hash-style)?` group lets
   // the implicit regex capture the line/range suffix in either format:
   //   colon: foo.ts:42, foo.ts:42:5, foo.ts:42-50, foo.ts:42:5-50:10
@@ -182,9 +191,83 @@ export class TerminalLinkManager extends BaseManager {
 
       this.linkProviderDisposables.set(terminalId, disposable);
       terminalLogger.debug(`Link provider registered for ${terminalId}`);
+
+      this._startProactiveScan(terminal, terminalId);
     } catch (error) {
       terminalLogger.warn(`Failed to register link provider for ${terminalId}:`, error);
     }
+  }
+
+  /**
+   * Patch (ruben): eagerly scan rows for links and paint their colour as
+   * content arrives. The existing hover-driven provideLinks is kept for
+   * click activation — xterm needs that path to know which cells are
+   * clickable. This one's purely cosmetic: run the same stitch + regex
+   * on visible rows, register decorations, dedupe via the existing
+   * linkDecorations cache.
+   *
+   * Hooked into onRender, which is the right signal: xterm fires it
+   * after any redraw with the exact `{start, end}` row range that
+   * changed (viewport-relative, 0-based). onLineFeed was the first
+   * attempt but Claude Code's animated UI barely emits line-feeds — it
+   * moves the cursor around with escape sequences and rewrites rows in
+   * place, so onLineFeed underfires badly. onRender catches everything
+   * at natural render cadence.
+   */
+  private _startProactiveScan(terminal: Terminal, terminalId: string): void {
+    // Tear down any prior state for this id (re-registration).
+    this._stopProactiveScan(terminalId);
+
+    const state = {
+      terminal,
+      lastScannedAbsRow: -1,
+      disposables: [] as IDisposable[],
+    };
+
+    // Scan an inclusive viewport-relative row range [startRow..endRow].
+    const scanRange = (startRow: number, endRow: number) => {
+      try {
+        const buf = terminal.buffer.active;
+        const baseY = buf.baseY;
+        const clampedStart = Math.max(0, startRow);
+        const clampedEnd = Math.min(terminal.rows - 1, endRow);
+        for (let vp = clampedStart; vp <= clampedEnd; vp++) {
+          const absRow = baseY + vp; // absolute 0-based (scrollback+viewport)
+          // findLinksInLine takes a 1-based absolute row index (it does
+          // `buffer.getLine(lineNumber - 1)`, and getLine indexes across
+          // scrollback+viewport). The stitcher walks up as needed, and
+          // _ensureLinkDecoration is cached per (terminalId, row, xStart,
+          // path) so repeated hits on stable rows are cheap.
+          this.findLinksInLine(terminal, absRow + 1, terminalId);
+        }
+      } catch (error) {
+        terminalLogger.warn('Proactive link scan failed:', error);
+      }
+    };
+
+    state.disposables.push(
+      terminal.onRender((ev) => {
+        scanRange(ev.start, ev.end);
+      })
+    );
+    // Initial full-viewport pass so pre-existing content gets coloured
+    // even if no render has fired yet (e.g. restored session).
+    scanRange(0, terminal.rows - 1);
+
+    this.proactiveScan.set(terminalId, state);
+  }
+
+  private _stopProactiveScan(terminalId: string): void {
+    const state = this.proactiveScan.get(terminalId);
+    if (!state) return;
+    for (const d of state.disposables) {
+      try {
+        d.dispose();
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    this.proactiveScan.delete(terminalId);
   }
 
   /**
@@ -712,6 +795,8 @@ export class TerminalLinkManager extends BaseManager {
       disposable.dispose();
       this.linkProviderDisposables.delete(terminalId);
     }
+    // Patch (ruben): also tear down the proactive scan listeners.
+    this._stopProactiveScan(terminalId);
     // Patch (ruben): drop colour decorations for this terminal too.
     const prefix = `${terminalId}:`;
     for (const [key, decoration] of this.linkDecorations) {
@@ -732,6 +817,10 @@ export class TerminalLinkManager extends BaseManager {
   protected doDispose(): void {
     this.linkProviderDisposables.forEach((d) => d.dispose());
     this.linkProviderDisposables.clear();
+    // Patch (ruben): tear down all proactive-scan listeners.
+    for (const id of Array.from(this.proactiveScan.keys())) {
+      this._stopProactiveScan(id);
+    }
     // Patch (ruben): dispose all colour decorations.
     this.linkDecorations.forEach((d) => d.dispose());
     this.linkDecorations.clear();
